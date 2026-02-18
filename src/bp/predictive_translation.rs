@@ -452,10 +452,15 @@ impl MemPool for PredictiveTranslationBP {
         loop {
             if let Some(idx) = self.translation.lookup(&key.p_key()) {
                 if let Some(g) = self.try_get_write_guard(idx, true) {
-                    g.evict_info().update();
-                    return Ok(g);
+                    if g.page_key() == Some(key.p_key()) {
+                        g.evict_info().update();
+                        return Ok(g);
+                    }
+                    // Frame was evicted and reused; fall through to fault.
+                } else if self.translation.lookup(&key.p_key()) == Some(idx) {
+                    return Err(MemPoolStatus::FrameWriteLatchGrantFailed);
                 }
-                return Err(MemPoolStatus::FrameWriteLatchGrantFailed);
+                continue;
             }
 
             // Avoid duplicate fault: another thread may have inserted already.
@@ -533,10 +538,15 @@ impl MemPool for PredictiveTranslationBP {
         loop {
             if let Some(idx) = self.translation.lookup(&key.p_key()) {
                 if let Some(g) = self.try_get_read_guard(idx) {
-                    g.evict_info().update();
-                    return Ok(g);
+                    if g.page_key() == Some(key.p_key()) {
+                        g.evict_info().update();
+                        return Ok(g);
+                    }
+                    // Frame was evicted and reused; fall through to fault.
+                } else if self.translation.lookup(&key.p_key()) == Some(idx) {
+                    return Err(MemPoolStatus::FrameReadLatchGrantFailed);
                 }
-                return Err(MemPoolStatus::FrameReadLatchGrantFailed);
+                continue;
             }
 
             if self.translation.contains_key(&key.p_key()) {
