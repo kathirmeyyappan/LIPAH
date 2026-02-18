@@ -307,9 +307,11 @@ impl PredictiveTranslationBP {
                     }
                     // Flush if dirty.
                     self.write_to_disk_if_dirty_w(&guard).unwrap();
-                    // Remove from translation table.
+                    // Remove from translation only if this frame is the one in the table.
                     if let Some(pk) = guard.page_key() {
-                        self.translation.remove(&pk);
+                        if self.translation.lookup(&pk) == Some(idx) {
+                            self.translation.remove(&pk);
+                        }
                     }
                     // Clear the frame.
                     guard.set_page_key(None);
@@ -445,49 +447,79 @@ impl MemPool for PredictiveTranslationBP {
         log_debug!("PT page write: {}", key);
         self.stats.inc_write_count();
 
-        // No physical hint — go straight to the translation table.
         self.ensure_free_frames()?;
 
-        if let Some(idx) = self.translation.lookup(&key.p_key()) {
-            if let Some(g) = self.try_get_write_guard(idx, true) {
-                g.evict_info().update();
-                return Ok(g);
+        loop {
+            if let Some(idx) = self.translation.lookup(&key.p_key()) {
+                if let Some(g) = self.try_get_write_guard(idx, true) {
+                    g.evict_info().update();
+                    return Ok(g);
+                }
+                return Err(MemPoolStatus::FrameWriteLatchGrantFailed);
             }
-            return Err(MemPoolStatus::FrameWriteLatchGrantFailed);
-        }
 
-        // Page fault: claim frame first so only one thread loads this page.
-        self.used_frames.fetch_add(1, Ordering::AcqRel);
-        let mut victim = match self.choose_victim() {
-            Some(v) => v,
-            None => {
+            // Avoid duplicate fault: another thread may have inserted already.
+            if self.translation.contains_key(&key.p_key()) {
+                continue;
+            }
+
+            self.used_frames.fetch_add(1, Ordering::AcqRel);
+            let mut victim = match self.choose_victim() {
+                Some(v) => v,
+                None => {
+                    self.used_frames.fetch_sub(1, Ordering::AcqRel);
+                    return Err(MemPoolStatus::CannotEvictPage);
+                }
+            };
+
+            debug_assert!(victim.page_key().is_none());
+
+            self.translation
+                .insert(key.p_key(), victim.frame_id() as usize);
+
+            // If we were overwritten, we're a duplicate — release and retry.
+            if self.translation.lookup(&key.p_key()) != Some(victim.frame_id() as usize) {
+                victim.set_page_key(None);
+                self.free_list.push(victim.frame_id() as usize).ok();
                 self.used_frames.fetch_sub(1, Ordering::AcqRel);
-                return Err(MemPoolStatus::CannotEvictPage);
+                continue;
             }
-        };
 
-        debug_assert!(victim.page_key().is_none());
+            // Re-check before disk I/O.
+            if self.translation.lookup(&key.p_key()) != Some(victim.frame_id() as usize) {
+                victim.set_page_key(None);
+                self.free_list.push(victim.frame_id() as usize).ok();
+                self.used_frames.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
 
-        // Claim the mapping before loading so concurrent lookups for this page
-        // see this frame and wait for our guard instead of loading a second copy.
-        self.translation
-            .insert(key.p_key(), victim.frame_id() as usize);
+            if let Err(e) = self.container_manager.get_container(key.p_key().c_key)
+                .read_page(key.p_key().page_id, &mut victim)
+            {
+                if self.translation.lookup(&key.p_key()) == Some(victim.frame_id() as usize) {
+                    self.translation.remove(&key.p_key());
+                }
+                victim.set_page_key(None);
+                self.free_list.push(victim.frame_id() as usize).ok();
+                self.used_frames.fetch_sub(1, Ordering::AcqRel);
+                return Err(MemPoolStatus::FileManagerError(e.to_string()));
+            }
 
-        if let Err(e) = self.container_manager.get_container(key.p_key().c_key)
-            .read_page(key.p_key().page_id, &mut victim)
-        {
-            self.translation.remove(&key.p_key());
-            victim.set_page_key(None);
-            self.free_list.push(victim.frame_id() as usize).ok();
-            self.used_frames.fetch_sub(1, Ordering::AcqRel);
-            return Err(MemPoolStatus::FileManagerError(e.to_string()));
+            victim.set_page_key(Some(key.p_key()));
+            victim.evict_info().reset();
+            victim.dirty().store(true, Ordering::Release);
+
+            // After load, we may have been overwritten — don't return a duplicate.
+            if self.translation.lookup(&key.p_key()) != Some(victim.frame_id() as usize) {
+                self.write_to_disk_if_dirty_w(&victim).ok();
+                victim.set_page_key(None);
+                self.free_list.push(victim.frame_id() as usize).ok();
+                self.used_frames.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+
+            return Ok(victim);
         }
-
-        victim.set_page_key(Some(key.p_key()));
-        victim.evict_info().reset();
-        victim.dirty().store(true, Ordering::Release);
-
-        Ok(victim)
     }
 
     // ----- get page for read ----------------------------------------------
@@ -496,47 +528,81 @@ impl MemPool for PredictiveTranslationBP {
         log_debug!("PT page read: {}", key);
         self.stats.inc_read_count();
 
-        // No physical hint — go straight to the translation table.
         self.ensure_free_frames()?;
 
-        if let Some(idx) = self.translation.lookup(&key.p_key()) {
-            if let Some(g) = self.try_get_read_guard(idx) {
-                g.evict_info().update();
-                return Ok(g);
+        loop {
+            if let Some(idx) = self.translation.lookup(&key.p_key()) {
+                if let Some(g) = self.try_get_read_guard(idx) {
+                    g.evict_info().update();
+                    return Ok(g);
+                }
+                return Err(MemPoolStatus::FrameReadLatchGrantFailed);
             }
-            return Err(MemPoolStatus::FrameReadLatchGrantFailed);
-        }
 
-        // Page fault: claim frame first so only one thread loads this page.
-        self.used_frames.fetch_add(1, Ordering::AcqRel);
-        let mut victim = match self.choose_victim() {
-            Some(v) => v,
-            None => {
+            if self.translation.contains_key(&key.p_key()) {
+                continue;
+            }
+
+            self.used_frames.fetch_add(1, Ordering::AcqRel);
+            let mut victim = match self.choose_victim() {
+                Some(v) => v,
+                None => {
+                    self.used_frames.fetch_sub(1, Ordering::AcqRel);
+                    return Err(MemPoolStatus::CannotEvictPage);
+                }
+            };
+
+            debug_assert!(victim.page_key().is_none());
+
+            self.translation
+                .insert(key.p_key(), victim.frame_id() as usize);
+
+            if self.translation.lookup(&key.p_key()) != Some(victim.frame_id() as usize) {
+                victim.set_page_key(None);
+                self.free_list.push(victim.frame_id() as usize).ok();
                 self.used_frames.fetch_sub(1, Ordering::AcqRel);
-                return Err(MemPoolStatus::CannotEvictPage);
+                continue;
             }
-        };
 
-        debug_assert!(victim.page_key().is_none());
+            if self.translation.lookup(&key.p_key()) != Some(victim.frame_id() as usize) {
+                victim.set_page_key(None);
+                self.free_list.push(victim.frame_id() as usize).ok();
+                self.used_frames.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
 
-        // Claim the mapping before loading so concurrent lookups see this frame.
-        self.translation
-            .insert(key.p_key(), victim.frame_id() as usize);
+            // Re-check before disk I/O.
+            if self.translation.lookup(&key.p_key()) != Some(victim.frame_id() as usize) {
+                victim.set_page_key(None);
+                self.free_list.push(victim.frame_id() as usize).ok();
+                self.used_frames.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
 
-        if let Err(e) = self.container_manager.get_container(key.p_key().c_key)
-            .read_page(key.p_key().page_id, &mut victim)
-        {
-            self.translation.remove(&key.p_key());
-            victim.set_page_key(None);
-            self.free_list.push(victim.frame_id() as usize).ok();
-            self.used_frames.fetch_sub(1, Ordering::AcqRel);
-            return Err(MemPoolStatus::FileManagerError(e.to_string()));
+            if let Err(e) = self.container_manager.get_container(key.p_key().c_key)
+                .read_page(key.p_key().page_id, &mut victim)
+            {
+                if self.translation.lookup(&key.p_key()) == Some(victim.frame_id() as usize) {
+                    self.translation.remove(&key.p_key());
+                }
+                victim.set_page_key(None);
+                self.free_list.push(victim.frame_id() as usize).ok();
+                self.used_frames.fetch_sub(1, Ordering::AcqRel);
+                return Err(MemPoolStatus::FileManagerError(e.to_string()));
+            }
+
+            victim.set_page_key(Some(key.p_key()));
+            victim.evict_info().reset();
+
+            if self.translation.lookup(&key.p_key()) != Some(victim.frame_id() as usize) {
+                victim.set_page_key(None);
+                self.free_list.push(victim.frame_id() as usize).ok();
+                self.used_frames.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+
+            return Ok(victim.downgrade());
         }
-
-        victim.set_page_key(Some(key.p_key()));
-        victim.evict_info().reset();
-
-        Ok(victim.downgrade())
     }
 
     // ----- prefetch -------------------------------------------------------
@@ -572,7 +638,9 @@ impl MemPool for PredictiveTranslationBP {
             };
             self.write_to_disk_if_dirty_w(&frame).unwrap();
             if let Some(pk) = frame.page_key() {
-                self.translation.remove(&pk);
+                if self.translation.lookup(&pk) == Some(i) {
+                    self.translation.remove(&pk);
+                }
             }
             frame.clear();
         });
